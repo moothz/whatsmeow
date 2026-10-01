@@ -375,6 +375,14 @@ func (cli *Client) UnfollowNewsletter(ctx context.Context, jid types.JID) error 
 	return err
 }
 
+// AcceptNewsletterAdminInvite accepts an admin invitation for a WhatsApp channel.
+func (cli *Client) AcceptNewsletterAdminInvite(ctx context.Context, jid types.JID) error {
+	_, err := cli.sendMexIQ(ctx, "6179636105471882", map[string]any{
+		"newsletter_id": jid.String(),
+	})
+	return err
+}
+
 type GetNewsletterMessagesParams struct {
 	Count  int
 	Before types.MessageServerID

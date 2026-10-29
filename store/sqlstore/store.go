@@ -41,6 +41,13 @@ var PostgresArrayWrapper func(any) interface {
 	sql.Scanner
 }
 
+type cachedMsgSecret struct {
+	secret []byte
+	sender types.JID
+}
+
+const maxCachedMsgSecrets = 20000
+
 type SQLStore struct {
 	*Container
 	JID string
@@ -51,6 +58,11 @@ type SQLStore struct {
 	contactCacheLock sync.Mutex
 
 	migratedPNSessionsCache *exsync.Set[string]
+
+	msgSecretLock  sync.RWMutex
+	msgSecretCache map[types.MessageID]cachedMsgSecret
+	msgSecretOrder []types.MessageID
+	msgSecretIdx   int
 }
 
 // NewSQLStore creates a new SQLStore with the given database container and user JID.
@@ -64,6 +76,8 @@ func NewSQLStore(c *Container, jid types.JID) *SQLStore {
 		contactCache: make(map[types.JID]*types.ContactInfo),
 
 		migratedPNSessionsCache: exsync.NewSet[string](),
+		msgSecretCache:          make(map[types.MessageID]cachedMsgSecret, 1024),
+		msgSecretOrder:          make([]types.MessageID, maxCachedMsgSecrets),
 	}
 }
 
@@ -74,7 +88,7 @@ const (
 		INSERT INTO whatsmeow_identity_keys (our_jid, their_id, identity) VALUES ($1, $2, $3)
 		ON CONFLICT (our_jid, their_id) DO UPDATE SET identity=excluded.identity
 	`
-	deleteAllIdentitiesQuery = `DELETE FROM whatsmeow_identity_keys WHERE our_jid=$1 AND their_id LIKE $2`
+	deleteAllIdentitiesQuery = `DELETE FROM whatsmeow_identity_keys WHERE our_jid=$1 AND their_id >= $2 || ':' AND their_id < $2 || ';'`
 	deleteIdentityQuery      = `DELETE FROM whatsmeow_identity_keys WHERE our_jid=$1 AND their_id=$2`
 	getIdentityQuery         = `SELECT identity FROM whatsmeow_identity_keys WHERE our_jid=$1 AND their_id=$2`
 )
@@ -85,12 +99,12 @@ func (s *SQLStore) PutIdentity(ctx context.Context, address string, key [32]byte
 }
 
 func (s *SQLStore) DeleteAllIdentities(ctx context.Context, phone string) error {
-	_, err := s.db.Exec(ctx, deleteAllIdentitiesQuery, s.JID, phone+":%")
+	_, err := s.db.Exec(ctx, deleteAllIdentitiesQuery, s.JID, phone)
 	return err
 }
 
 func (s *SQLStore) DeleteIdentity(ctx context.Context, address string) error {
-	_, err := s.db.Exec(ctx, deleteAllIdentitiesQuery, s.JID, address)
+	_, err := s.db.Exec(ctx, deleteIdentityQuery, s.JID, address)
 	return err
 }
 
@@ -117,30 +131,40 @@ const (
 		INSERT INTO whatsmeow_sessions (our_jid, their_id, session) VALUES ($1, $2, $3)
 		ON CONFLICT (our_jid, their_id) DO UPDATE SET session=excluded.session
 	`
-	deleteAllSessionsQuery = `DELETE FROM whatsmeow_sessions WHERE our_jid=$1 AND their_id LIKE $2`
+	deleteAllSessionsQuery = `DELETE FROM whatsmeow_sessions WHERE our_jid=$1 AND their_id >= $2 || ':' AND their_id < $2 || ';'`
 	deleteSessionQuery     = `DELETE FROM whatsmeow_sessions WHERE our_jid=$1 AND their_id=$2`
+
+	hasPNToMigrateQuery = `
+		SELECT EXISTS(
+			SELECT 1 FROM whatsmeow_sessions WHERE our_jid=$1 AND their_id >= $2 || ':' AND their_id < $2 || ';'
+			UNION ALL
+			SELECT 1 FROM whatsmeow_identity_keys WHERE our_jid=$1 AND their_id >= $2 || ':' AND their_id < $2 || ';'
+			UNION ALL
+			SELECT 1 FROM whatsmeow_sender_keys WHERE our_jid=$1 AND sender_id >= $2 || ':' AND sender_id < $2 || ';'
+		)
+	`
 
 	migratePNToLIDSessionsQuery = `
 		INSERT INTO whatsmeow_sessions (our_jid, their_id, session)
 		SELECT our_jid, replace(their_id, $2, $3), session
 		FROM whatsmeow_sessions
-		WHERE our_jid=$1 AND their_id LIKE $2 || ':%'
+		WHERE our_jid=$1 AND their_id >= $2 || ':' AND their_id < $2 || ';'
 		ON CONFLICT (our_jid, their_id) DO UPDATE SET session=excluded.session
 	`
-	deleteAllIdentityKeysQuery      = `DELETE FROM whatsmeow_identity_keys WHERE our_jid=$1 AND their_id LIKE $2`
+	deleteAllIdentityKeysQuery      = `DELETE FROM whatsmeow_identity_keys WHERE our_jid=$1 AND their_id >= $2 || ':' AND their_id < $2 || ';'`
 	migratePNToLIDIdentityKeysQuery = `
 		INSERT INTO whatsmeow_identity_keys (our_jid, their_id, identity)
 		SELECT our_jid, replace(their_id, $2, $3), identity
 		FROM whatsmeow_identity_keys
-		WHERE our_jid=$1 AND their_id LIKE $2 || ':%'
+		WHERE our_jid=$1 AND their_id >= $2 || ':' AND their_id < $2 || ';'
 		ON CONFLICT (our_jid, their_id) DO UPDATE SET identity=excluded.identity
 	`
-	deleteAllSenderKeysQuery      = `DELETE FROM whatsmeow_sender_keys WHERE our_jid=$1 AND sender_id LIKE $2`
+	deleteAllSenderKeysQuery      = `DELETE FROM whatsmeow_sender_keys WHERE our_jid=$1 AND sender_id >= $2 || ':' AND sender_id < $2 || ';'`
 	migratePNToLIDSenderKeysQuery = `
 		INSERT INTO whatsmeow_sender_keys (our_jid, chat_id, sender_id, sender_key)
 		SELECT our_jid, chat_id, replace(sender_id, $2, $3), sender_key
 		FROM whatsmeow_sender_keys
-		WHERE our_jid=$1 AND sender_id LIKE $2 || ':%'
+		WHERE our_jid=$1 AND sender_id >= $2 || ':' AND sender_id < $2 || ';'
 		ON CONFLICT (our_jid, chat_id, sender_id) DO UPDATE SET sender_key=excluded.sender_key
 	`
 )
@@ -226,17 +250,17 @@ func (s *SQLStore) DeleteAllSessions(ctx context.Context, phone string) error {
 }
 
 func (s *SQLStore) deleteAllSessions(ctx context.Context, phone string) error {
-	_, err := s.db.Exec(ctx, deleteAllSessionsQuery, s.JID, phone+":%")
+	_, err := s.db.Exec(ctx, deleteAllSessionsQuery, s.JID, phone)
 	return err
 }
 
 func (s *SQLStore) deleteAllSenderKeys(ctx context.Context, phone string) error {
-	_, err := s.db.Exec(ctx, deleteAllSenderKeysQuery, s.JID, phone+":%")
+	_, err := s.db.Exec(ctx, deleteAllSenderKeysQuery, s.JID, phone)
 	return err
 }
 
 func (s *SQLStore) deleteAllIdentityKeys(ctx context.Context, phone string) error {
-	_, err := s.db.Exec(ctx, deleteAllIdentityKeysQuery, s.JID, phone+":%")
+	_, err := s.db.Exec(ctx, deleteAllIdentityKeysQuery, s.JID, phone)
 	return err
 }
 
@@ -248,6 +272,10 @@ func (s *SQLStore) DeleteSession(ctx context.Context, address string) error {
 func (s *SQLStore) MigratePNToLID(ctx context.Context, pn, lid types.JID) error {
 	pnSignal := pn.SignalAddressUser()
 	if !s.migratedPNSessionsCache.Add(pnSignal) {
+		return nil
+	}
+	var hasAny bool
+	if err := s.db.QueryRow(ctx, hasPNToMigrateQuery, s.JID, pnSignal).Scan(&hasAny); err == nil && !hasAny {
 		return nil
 	}
 	var sessionsUpdated, identityKeysUpdated, senderKeysUpdated int64
@@ -903,35 +931,52 @@ const (
 	`
 )
 
-func (s *SQLStore) PutMessageSecrets(ctx context.Context, inserts []store.MessageSecretInsert) (err error) {
-	if len(inserts) == 0 {
-		return nil
+func (s *SQLStore) putMsgSecretInMemory(sender types.JID, id types.MessageID, secret []byte) {
+	if id == "" || len(secret) == 0 {
+		return
 	}
-	return s.db.DoTxn(ctx, nil, func(ctx context.Context) error {
-		for _, insert := range inserts {
-			if insert.Chat.IsEmpty() || insert.Sender.IsEmpty() || insert.ID == "" || len(insert.Secret) == 0 {
-				continue
-			}
-			_, err = s.db.Exec(ctx, putMsgSecret, s.JID, insert.Chat.ToNonAD(), insert.Sender.ToNonAD(), insert.ID, insert.Secret)
-			if err != nil {
-				return err
-			}
+	secretCopy := make([]byte, len(secret))
+	copy(secretCopy, secret)
+	cleanSender := sender.ToNonAD()
+
+	s.msgSecretLock.Lock()
+	if _, exists := s.msgSecretCache[id]; !exists {
+		if oldID := s.msgSecretOrder[s.msgSecretIdx]; oldID != "" {
+			delete(s.msgSecretCache, oldID)
 		}
-		return nil
-	})
+		s.msgSecretOrder[s.msgSecretIdx] = id
+		s.msgSecretIdx = (s.msgSecretIdx + 1) % maxCachedMsgSecrets
+	}
+	s.msgSecretCache[id] = cachedMsgSecret{
+		secret: secretCopy,
+		sender: cleanSender,
+	}
+	s.msgSecretLock.Unlock()
+}
+
+func (s *SQLStore) PutMessageSecrets(ctx context.Context, inserts []store.MessageSecretInsert) (err error) {
+	for _, insert := range inserts {
+		if insert.Chat.IsEmpty() || insert.Sender.IsEmpty() || insert.ID == "" || len(insert.Secret) == 0 {
+			continue
+		}
+		s.putMsgSecretInMemory(insert.Sender, insert.ID, insert.Secret)
+	}
+	return nil
 }
 
 func (s *SQLStore) PutMessageSecret(ctx context.Context, chat, sender types.JID, id types.MessageID, secret []byte) (err error) {
-	_, err = s.db.Exec(ctx, putMsgSecret, s.JID, chat.ToNonAD(), sender.ToNonAD(), id, secret)
-	return
+	s.putMsgSecretInMemory(sender, id, secret)
+	return nil
 }
 
 func (s *SQLStore) GetMessageSecret(ctx context.Context, chat, sender types.JID, id types.MessageID) (secret []byte, realSender types.JID, err error) {
-	err = s.db.QueryRow(ctx, getMsgSecret, s.JID, chat.ToNonAD(), sender.ToNonAD(), id).Scan(&secret, &realSender)
-	if errors.Is(err, sql.ErrNoRows) {
-		err = nil
+	s.msgSecretLock.RLock()
+	entry, ok := s.msgSecretCache[id]
+	s.msgSecretLock.RUnlock()
+	if ok {
+		return entry.secret, entry.sender, nil
 	}
-	return
+	return nil, types.EmptyJID, nil
 }
 
 const (

@@ -389,6 +389,9 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 	cli.messageSendLock.Lock()
 	resp.DebugTimings.Queue = time.Since(start)
 	defer cli.messageSendLock.Unlock()
+	if err = ctx.Err(); err != nil {
+		return
+	}
 
 	// Peer message retries aren't implemented yet
 	if !req.Peer {

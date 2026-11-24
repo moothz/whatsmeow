@@ -942,6 +942,8 @@ func getTypeFromMessage(msg *waE2E.Message) string {
 		return getTypeFromMessage(msg.ViewOnceMessageV2Extension.Message)
 	case msg.LottieStickerMessage != nil:
 		return getTypeFromMessage(msg.LottieStickerMessage.Message)
+	case msg.AudioStickerMessage != nil:
+		return getTypeFromMessage(msg.AudioStickerMessage.Message)
 	case msg.EphemeralMessage != nil:
 		return getTypeFromMessage(msg.EphemeralMessage.Message)
 	case msg.DocumentWithCaptionMessage != nil:
@@ -969,6 +971,8 @@ func getMediaTypeFromMessage(msg *waE2E.Message) string {
 		return getMediaTypeFromMessage(msg.ViewOnceMessageV2Extension.Message)
 	case msg.LottieStickerMessage != nil:
 		return getMediaTypeFromMessage(msg.LottieStickerMessage.Message)
+	case msg.AudioStickerMessage != nil:
+		return getMediaTypeFromMessage(msg.AudioStickerMessage.Message)
 	case msg.EphemeralMessage != nil:
 		return getMediaTypeFromMessage(msg.EphemeralMessage.Message)
 	case msg.DocumentWithCaptionMessage != nil:
